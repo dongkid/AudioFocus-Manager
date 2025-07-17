@@ -1,0 +1,7 @@
+__pycache__
+.vscode
+main.dist
+nuitka-crash-report.xml
+main.exe
+logs
+dev_docs
