@@ -10,3 +10,4 @@ winrt-Windows.Media.Audio
 winrt-Windows.Media.Control
 pywin32==306
 PyYAML
+cachetools

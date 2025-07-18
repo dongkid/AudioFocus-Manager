@@ -8,6 +8,7 @@ from PIL import Image, ImageDraw, ImageTk
 import ctypes
 import gc
 import queue
+import tracemalloc
 
 from worker import BackgroundWorker
 from logger import logger
@@ -142,11 +143,14 @@ class AppEntry(tk.Frame):
 
                 self.photo = ImageTk.PhotoImage(final_image)
                 self.icon_label.config(image=self.photo, text="")
+                self.icon_label.image = self.photo # 锚定对图像的引用以防止垃圾回收
             except Exception as e:
                 logger.log_error(f"Error updating icon: {e}")
                 self.icon_label.config(image='', text="🖼️")
+                self.icon_label.image = None
         else:
             self.icon_label.config(image='', text="🎵")
+            self.icon_label.image = None
 
         self.name_label.config(text=app_info['display_name'])
         self.title_label.config(text=app_info.get('title', 'N/A'))
@@ -163,13 +167,14 @@ class AppEntry(tk.Frame):
 
     def destroy(self):
         """自定义销毁方法，确保所有图像和回调引用都被清理，防止内存泄漏。"""
-        if hasattr(self, 'icon_label'):
+        if hasattr(self, 'icon_label') and self.icon_label.winfo_exists():
+            # 显式解除tkinter控件对图像的引用
             self.icon_label.config(image='')
-        self.photo = None
+            self.icon_label.image = None # 打破循环引用
         
+        self.photo = None
         self.on_select_callback = None
         self.on_control_callback = None
-
         self.app_info = None
         
         super().destroy()
@@ -206,9 +211,7 @@ class AppListWindow(tk.Frame):
         self.canvas = tk.Canvas(self, bg="white", highlightthickness=0)
         self.scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
         
-        style = ttk.Style(self)
-        style.configure("White.TFrame", background="white")
-        self.scrollable_frame = ttk.Frame(self.canvas, style="White.TFrame")
+        self.scrollable_frame = ttk.Frame(self.canvas)
 
         self.canvas_frame_id = self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
 
@@ -318,6 +321,7 @@ class AudioFocusApp(tk.Tk):
 
         self.debug_mode_var = tk.BooleanVar(value=config_manager.get('general.debug_mode', True))
         self.always_on_top_var = tk.BooleanVar(value=config_manager.get('general.always_on_top', False))
+        self.mem_snapshot = None
         
         self.setup_menu()
         
@@ -336,6 +340,7 @@ class AudioFocusApp(tk.Tk):
         self.current_audio_apps = []
         self.latest_app_infos = {}
         self.properties_window = None
+        self.settings_window = None
         
         self.ui_queue = queue.Queue()
         self.worker_queue = queue.Queue()
@@ -402,6 +407,12 @@ class AudioFocusApp(tk.Tk):
         help_menu.add_command(label="关于", command=self.show_about_window)
         self.menubar.add_cascade(label="帮助", menu=help_menu)
 
+        # 调试菜单
+        debug_menu = tk.Menu(self.menubar, tearoff=0)
+        debug_menu.add_command(label="拍下内存快照 (Take Memory Snapshot)", command=self._take_memory_snapshot)
+        debug_menu.add_command(label="分析内存增量 (Analyze Memory Delta)", command=self._analyze_memory_delta)
+        self.menubar.add_cascade(label="调试 (Debug)", menu=debug_menu)
+
         self.config(menu=self.menubar)
 
     def _set_menu_state(self, state):
@@ -428,7 +439,7 @@ class AudioFocusApp(tk.Tk):
         app_name = ttk.Label(main_frame, text="Audio Focus Manager", font=("Segoe UI", 12, "bold"))
         app_name.pack(pady=(0, 5))
 
-        version_label = ttk.Label(main_frame, text="版本: 1.0.0")
+        version_label = ttk.Label(main_frame, text="版本: 1.1.0")
         version_label.pack()
 
         desc_label = ttk.Label(main_frame, text="一个自动管理音频焦点的工具。")
@@ -468,18 +479,22 @@ class AudioFocusApp(tk.Tk):
                 msg_type = message.get('type')
                 data = message.get('data')
 
-                if msg_type in ['update_list', 'update_status']:
-                    if not self.app_list_window or not self.app_list_window.winfo_exists():
-                        logger.log_debug(f"UI不存在，忽略UI消息: {msg_type}")
-                        continue
+                # 仅在窗口可见时处理UI更新
+                if self.state() == 'normal':
+                    if msg_type in ['update_list', 'update_status']:
+                        if not self.app_list_window or not self.app_list_window.winfo_exists():
+                            logger.log_debug(f"UI不存在，忽略UI消息: {msg_type}")
+                            continue
 
-                if msg_type == 'update_list':
-                    self.latest_app_infos = {app['source']: app for app in data}
-                    self.app_list_window.update_app_list(data)
-                    self._update_properties_window_if_open()
-                elif msg_type == 'update_status':
-                    self.app_list_window.update_status(**data)
-                elif msg_type == 'set_paused_flag':
+                    if msg_type == 'update_list':
+                        self.latest_app_infos = {app['source']: app for app in data}
+                        self.app_list_window.update_app_list(data)
+                        self._update_properties_window_if_open()
+                    elif msg_type == 'update_status':
+                        self.app_list_window.update_status(**data)
+                
+                # 这些消息应该总是被处理，无论窗口是否可见
+                if msg_type == 'set_paused_flag':
                     self.was_paused_by_app = data
                     self._send_state_to_worker()
                 elif msg_type == 'target_closed':
@@ -490,6 +505,7 @@ class AudioFocusApp(tk.Tk):
                     self._send_state_to_worker()
                 elif msg_type == 'update_audio_apps':
                     self.current_audio_apps = data
+                    self._update_settings_window_if_open()
 
         except queue.Empty:
             pass
@@ -517,7 +533,13 @@ class AudioFocusApp(tk.Tk):
 
     def show_settings_window(self):
         self._set_menu_state("disabled")
-        settings_win = SettingsWindow(self)
+        
+        # 简化 SettingsWindow 的生命周期管理
+        if self.settings_window and self.settings_window.winfo_exists():
+            self.settings_window.destroy()
+        
+        self.settings_window = SettingsWindow(self)
+        self.settings_window.protocol("WM_DELETE_WINDOW", self._on_settings_window_close)
         
         current_retention_days = config_manager.get('logging.log_retention_days')
         whitelist = config_manager.get('audio.whitelist', {})
@@ -525,36 +547,47 @@ class AudioFocusApp(tk.Tk):
         all_known_apps_cache = self.worker.get_all_known_apps()
         final_app_list_for_settings = list(all_known_apps_cache.values())
 
-        settings_win.set_initial_values(
+        self.settings_window.set_initial_values(
             debug=self.debug_mode_var.get(),
             top=self.always_on_top_var.get(),
             retention=current_retention_days,
             whitelist=whitelist,
-            all_audio_apps=final_app_list_for_settings
+            all_audio_apps=final_app_list_for_settings,
+            ignore_manual_pause=config_manager.get('general.ignore_manual_pause', False)
         )
         
-        self.wait_window(settings_win)
+        # 不再使用 wait_window，以允许主窗口继续接收事件
+        # self.wait_window(settings_win)
 
-        if settings_win.was_saved:
-            new_values = settings_win.get_values()
-            
-            self.debug_mode_var.set(new_values['debug_mode'])
-            self.always_on_top_var.set(new_values['always_on_top'])
-            
-            self.toggle_debug_mode()
-            self.toggle_always_on_top()
-            
-            config_manager.set('general.debug_mode', new_values['debug_mode'])
-            config_manager.set('general.always_on_top', new_values['always_on_top'])
-            config_manager.set('logging.log_retention_days', new_values['log_retention_days'])
-            config_manager.set('audio.whitelist', new_values['whitelist'])
-            config_manager.save_config()
+    def _on_settings_window_close(self):
+        if not self.settings_window:
+            return
 
-            self.worker_queue.put({'type': 'config_updated', 'data': None})
-            
-            logger.log_info("设置已从设置窗口保存。")
-        
-        self._set_menu_state("normal")
+        try:
+            if self.settings_window.was_saved and self.settings_window.saved_values is not None:
+                new_values = self.settings_window.saved_values
+                
+                self.debug_mode_var.set(new_values['debug_mode'])
+                self.always_on_top_var.set(new_values['always_on_top'])
+                
+                self.toggle_debug_mode()
+                self.toggle_always_on_top()
+                
+                config_manager.set('general.debug_mode', new_values['debug_mode'])
+                config_manager.set('general.always_on_top', new_values['always_on_top'])
+                config_manager.set('logging.log_retention_days', new_values['log_retention_days'])
+                config_manager.set('audio.whitelist', new_values['whitelist'])
+                config_manager.set('general.ignore_manual_pause', new_values['ignore_manual_pause'])
+                config_manager.save_config()
+
+                self.worker_queue.put({'type': 'config_updated', 'data': None})
+                
+                logger.log_info("设置已从设置窗口保存。")
+        finally:
+            if self.settings_window and self.settings_window.winfo_exists():
+                self.settings_window.destroy()
+            self.settings_window = None
+            self._set_menu_state("normal")
 
     def toggle_debug_mode(self, is_initial_setup=False):
         is_enabled = self.debug_mode_var.get()
@@ -585,26 +618,10 @@ class AudioFocusApp(tk.Tk):
         tray_thread.start()
 
     def show_window(self):
-        try:
-            if not hasattr(self, 'app_list_window') or not self.app_list_window or not self.app_list_window.winfo_exists():
-                logger.log_info("UI不存在或已被销毁，正在重新创建...")
-                self.app_list_window = AppListWindow(self)
-                self.app_list_window.pack(fill="both", expand=True)
-                self.app_list_window.set_callbacks(
-                    select_callback=self.on_target_app_selected,
-                    control_callback=self.on_app_control
-                )
-                
-                if self.target_app_info:
-                    self.app_list_window.target_app_source = self.target_app_info.get('source')
-                    self.app_list_window.update_status(target_name=self.target_app_info.get('display_name'))
-                
-                self.worker_queue.put({'type': 'force_refresh', 'data': None})
-        except tk.TclError:
-            logger.log_error("主窗口恢复失败。")
-            return
-
-        self.deiconify()
+        """显示主窗口，如果它被隐藏了。"""
+        if self.state() == 'withdrawn':
+            self.deiconify()
+            self.worker_queue.put({'type': 'force_refresh'})
         self.lift()
         self.focus_force()
 
@@ -641,19 +658,19 @@ class AudioFocusApp(tk.Tk):
         if command == 'toggle_play_pause':
             self.worker_queue.put({
                 'type': 'control_app',
-                'data': {'source': app_info['source'], 'command': 'toggle'}
+                'data': {
+                    'source': app_info['source'],
+                    'command': 'toggle',
+                    'status': app_info.get('status')
+                }
             })
         elif command == 'show_properties':
+            # 简化 PropertiesWindow 的生命周期管理
             if self.properties_window and self.properties_window.winfo_exists():
-                self.properties_window.lift()
-                return
-
+                self.properties_window.destroy()
+            
             source = app_info.get('source')
-            latest_info = self.latest_app_infos.get(source)
-            if not latest_info:
-                logger.log_warning(f"没有找到 {app_info.get('display_name')} 的最新详细信息。")
-                latest_info = app_info
-
+            latest_info = self.latest_app_infos.get(source, app_info)
             self.properties_window = PropertiesWindow(self, latest_info)
             self.properties_window.protocol("WM_DELETE_WINDOW", self._on_properties_window_close)
             
@@ -691,13 +708,40 @@ class AudioFocusApp(tk.Tk):
             else:
                 self._on_properties_window_close()
 
+    def _update_settings_window_if_open(self):
+        if self.settings_window and self.settings_window.winfo_exists():
+            self.settings_window.update_app_statuses(self.current_audio_apps)
+
     def on_closing(self):
-        logger.log_info("关闭窗口以释放资源，程序仍在后台运行。")
-        if hasattr(self, 'app_list_window') and self.app_list_window and self.app_list_window.winfo_exists():
-            self.app_list_window.destroy()
-        self.app_list_window = None
-        self.worker_queue.put({'type': 'ui_destroyed', 'data': None})
+        """当用户点击关闭按钮时，隐藏窗口而不是销毁它。"""
+        logger.log_info("隐藏主窗口，程序仍在后台运行。")
         self.withdraw()
+        # 不需要再手动执行垃圾回收或销毁UI组件
+
+    def _take_memory_snapshot(self):
+        """捕获当前的内存分配快照。"""
+        self.mem_snapshot = tracemalloc.take_snapshot()
+        logger.log_info("内存快照已捕获。")
+        print("内存快照已捕获。")
+
+    def _analyze_memory_delta(self):
+        """分析自上次快照以来的内存增量。"""
+        if not self.mem_snapshot:
+            logger.log_warning("请先拍下内存快照。")
+            print("请先使用“拍下内存快照”功能捕获一个基准快照。")
+            return
+
+        new_snapshot = tracemalloc.take_snapshot()
+        stats = new_snapshot.compare_to(self.mem_snapshot, 'lineno')
         
-        logger.log_info("正在执行垃圾回收...")
-        gc.collect()
+        print("\n==================== MEMORY DELTA ANALYSIS ====================")
+        print("Top 10 memory differences:")
+        
+        for i, stat in enumerate(stats[:10], 1):
+            print(f"#{i}: {stat}")
+
+        print("=============================================================\n")
+
+        # 更新快照以供下次比较
+        self.mem_snapshot = new_snapshot
+        logger.log_info("内存增量分析完成，基准快照已更新。")

@@ -1,8 +1,10 @@
+import tracemalloc
 from app import AudioFocusApp, set_dpi_awareness
 from logger import logger
 from config import config_manager
 
 if __name__ == "__main__":
+    tracemalloc.start()
     set_dpi_awareness()
     
     # 从配置初始化日志记录器

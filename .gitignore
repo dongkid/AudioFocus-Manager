@@ -5,3 +5,5 @@ nuitka-crash-report.xml
 main.exe
 logs
 dev_docs
+AudioFocusManager.exe
+config.yaml

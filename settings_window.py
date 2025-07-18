@@ -45,10 +45,8 @@ class WhitelistEntry(tk.Frame):
         self.status_label.grid(row=1, column=1, sticky="ew", padx=5)
 
         # --- 控制器 ---
-        control_frame = ttk.Frame(self, style="White.TFrame")
+        control_frame = ttk.Frame(self)
         control_frame.grid(row=0, column=2, rowspan=2, padx=10, pady=5)
-        self.style = ttk.Style()
-        self.style.configure("White.TFrame", background="white")
 
         self.mode_combo = ttk.Combobox(control_frame, textvariable=self.mode_var, values=list(self.MODE_MAP.keys()), state="readonly", width=8)
         self.mode_combo.grid(row=0, column=0, padx=(0, 5))
@@ -97,6 +95,27 @@ class WhitelistEntry(tk.Frame):
             if process_name:
                 self.on_update_callback(process_name, new_settings)
 
+    def destroy(self):
+        """销毁控件时清理图像引用。"""
+        if hasattr(self, 'icon_label') and self.icon_label.winfo_exists():
+            self.icon_label.config(image='')
+            self.icon_label.image = None
+        self.photo = None
+        self.on_update_callback = None
+        super().destroy()
+
+    def update_status(self, app_info):
+        """仅更新此条目的播放状态，而不重新创建整个控件。"""
+        if not self.winfo_exists():
+            return
+        
+        self.app_info.update(app_info) # 更新内部信息
+        
+        process_name = self.app_info.get('process_name', 'N/A')
+        status_icon = "▶️ 播放中" if self.app_info.get('is_playing') else "⏹️ 静默"
+        status_text = f"{process_name}  •  {status_icon}"
+        self.status_label.config(text=status_text)
+
 class SettingsWindow(tk.Toplevel):
     def __init__(self, parent):
         super().__init__(parent)
@@ -107,14 +126,17 @@ class SettingsWindow(tk.Toplevel):
         self.minsize(600, 500)
 
         self.was_saved = False
+        self.saved_values = None
         self.parent = parent
         self.all_audio_apps = {}
         self.whitelist = {}
+        self.whitelist_entries = {}
 
         # 创建UI变量
         self.always_on_top_var = tk.BooleanVar()
         self.debug_mode_var = tk.BooleanVar()
         self.log_retention_days_var = tk.IntVar()
+        self.ignore_manual_pause_var = tk.BooleanVar()
 
         self.create_widgets()
         self.center_window()
@@ -151,7 +173,7 @@ class SettingsWindow(tk.Toplevel):
         save_button = ttk.Button(button_frame, text="保存", command=self.save_and_close)
         save_button.grid(row=0, column=0, sticky="e", padx=5)
 
-        cancel_button = ttk.Button(button_frame, text="取消", command=self.destroy)
+        cancel_button = ttk.Button(button_frame, text="取消", command=self.cancel_and_close)
         cancel_button.grid(row=0, column=1, sticky="w", padx=5)
 
     def _create_general_settings(self, parent):
@@ -169,6 +191,11 @@ class SettingsWindow(tk.Toplevel):
             general_group, text="调试模式", variable=self.debug_mode_var
         )
         debug_mode_check.pack(anchor="w", pady=5)
+
+        ignore_manual_pause_check = ttk.Checkbutton(
+            general_group, text="手动暂停后不自动恢复", variable=self.ignore_manual_pause_var
+        )
+        ignore_manual_pause_check.pack(anchor="w", pady=5)
 
         # --- 日志设置 ---
         logging_group = ttk.LabelFrame(parent, text="日志", padding="10")
@@ -211,13 +238,12 @@ class SettingsWindow(tk.Toplevel):
         self.scrollable_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.bind('<Configure>', lambda e: canvas.itemconfig(canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw"), width=e.width))
         
-        self.whitelist_entries = {}
-
-    def set_initial_values(self, debug, top, retention, whitelist, all_audio_apps):
+    def set_initial_values(self, debug, top, retention, whitelist, all_audio_apps, ignore_manual_pause):
         """从主程序接收当前的临时设置值。"""
         self.debug_mode_var.set(debug)
         self.always_on_top_var.set(top)
         self.log_retention_days_var.set(retention)
+        self.ignore_manual_pause_var.set(ignore_manual_pause)
         
         self.whitelist = whitelist.copy()
         # 使用 process_name 作为字典的键，因为它更唯一
@@ -241,8 +267,9 @@ class SettingsWindow(tk.Toplevel):
 
     def _update_whitelist_display(self):
         """根据当前数据更新白名单UI。"""
-        for widget in self.scrollable_frame.winfo_children():
-            widget.destroy()
+        for entry in self.whitelist_entries.values():
+            entry.destroy()
+        self.whitelist_entries.clear()
         
         # 按显示名称排序，如果显示名称相同，则按进程名排序
         sorted_app_items = sorted(
@@ -257,6 +284,7 @@ class SettingsWindow(tk.Toplevel):
             current_settings = self.whitelist.get(process_name, {})
             entry = WhitelistEntry(self.scrollable_frame, app_info, current_settings, self._on_update_whitelist)
             entry.pack(fill="x", pady=2, padx=2)
+            self.whitelist_entries[process_name] = entry
 
     def _on_update_whitelist(self, process_name, new_settings):
         """处理白名单条目设置的更新。"""
@@ -265,6 +293,25 @@ class SettingsWindow(tk.Toplevel):
             self.whitelist.pop(process_name, None)
         else:
             self.whitelist[process_name] = new_settings
+
+    def update_app_statuses(self, all_audio_apps):
+        """根据最新的音频应用信息更新白名单条目的状态。"""
+        if not self.winfo_exists():
+            return
+            
+        apps_by_process_name = {
+            app['process_name']: app
+            for app in all_audio_apps
+            if app.get('process_name')
+        }
+
+        for process_name, entry in self.whitelist_entries.items():
+            if process_name in apps_by_process_name:
+                latest_info = apps_by_process_name[process_name]
+                entry.update_status(latest_info)
+            else:
+                # 如果应用已不在播放列表中，则将其标记为静默
+                entry.update_status({'is_playing': False})
 
     def get_values(self):
         """返回UI控件的当前值。"""
@@ -277,13 +324,30 @@ class SettingsWindow(tk.Toplevel):
             'debug_mode': self.debug_mode_var.get(),
             'always_on_top': self.always_on_top_var.get(),
             'log_retention_days': self.log_retention_days_var.get(),
-            'whitelist': cleaned_whitelist
+            'whitelist': cleaned_whitelist,
+            'ignore_manual_pause': self.ignore_manual_pause_var.get()
         }
 
     def save_and_close(self):
-        """标记为已保存并关闭窗口。"""
+        """获取当前值，标记为已保存，然后调用父窗口的关闭处理程序。"""
         self.was_saved = True
-        self.destroy()
+        self.saved_values = self.get_values()
+        # 调用父窗口的关闭处理程序，而不是直接销毁
+        if self.parent and hasattr(self.parent, '_on_settings_window_close'):
+            self.parent._on_settings_window_close()
+
+    def cancel_and_close(self):
+        """不保存，直接调用父窗口的关闭处理程序。"""
+        self.was_saved = False
+        if self.parent and hasattr(self.parent, '_on_settings_window_close'):
+            self.parent._on_settings_window_close()
+
+    def destroy(self):
+        """销毁窗口时，确保所有子控件也被正确销毁。"""
+        for entry in self.whitelist_entries.values():
+            entry.destroy()
+        self.whitelist_entries.clear()
+        super().destroy()
 
     def center_window(self):
         """将窗口居中于父窗口。"""
